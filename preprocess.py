@@ -16,39 +16,14 @@ from pathlib import Path
 from lxml import etree
 import pandas as pd
 
+from config import HK_TYPE_MAP
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
 DEFAULT_EXPORT = Path(__file__).parent.parent / "apple_health_export" / "exportación.xml"
 OUTPUT_DIR = Path(__file__).parent / "data"
-
-# HK types we care about → short filename
-TYPE_MAP = {
-    "HKQuantityTypeIdentifierStepCount":                "steps",
-    "HKQuantityTypeIdentifierHeartRate":                "heart_rate",
-    "HKQuantityTypeIdentifierRestingHeartRate":         "resting_hr",
-    "HKQuantityTypeIdentifierActiveEnergyBurned":       "active_energy",
-    "HKQuantityTypeIdentifierBasalEnergyBurned":        "basal_energy",
-    "HKQuantityTypeIdentifierDistanceWalkingRunning":   "distance_walk",
-    "HKQuantityTypeIdentifierDistanceCycling":          "distance_cycling",
-    "HKQuantityTypeIdentifierFlightsClimbed":           "flights_climbed",
-    "HKCategoryTypeIdentifierSleepAnalysis":            "sleep",
-    "HKQuantityTypeIdentifierBodyMass":                 "body_mass",
-    "HKQuantityTypeIdentifierBodyMassIndex":            "bmi",
-    "HKQuantityTypeIdentifierBodyFatPercentage":        "body_fat",
-    "HKQuantityTypeIdentifierLeanBodyMass":             "lean_body_mass",
-    "HKQuantityTypeIdentifierWalkingSpeed":             "walking_speed",
-    "HKQuantityTypeIdentifierAppleWalkingSteadiness":   "walking_steadiness",
-    "HKQuantityTypeIdentifierDietaryEnergyConsumed":    "dietary_energy",
-    "HKQuantityTypeIdentifierDietaryProtein":           "dietary_protein",
-    "HKQuantityTypeIdentifierDietaryCarbohydrates":     "dietary_carbs",
-    "HKQuantityTypeIdentifierDietaryFatTotal":          "dietary_fat",
-    "HKQuantityTypeIdentifierHeadphoneAudioExposure":   "headphone_audio",
-    "HKQuantityTypeIdentifierWalkingStepLength":        "walking_step_length",
-    "HKQuantityTypeIdentifierWalkingDoubleSupportPercentage": "walking_double_support",
-    "HKQuantityTypeIdentifierWalkingAsymmetryPercentage": "walking_asymmetry",
-}
 
 
 def parse_and_save(export_path: Path, output_dir: Path) -> None:
@@ -70,7 +45,7 @@ def parse_and_save(export_path: Path, output_dir: Path) -> None:
 
         elif tag == "Record":
             hk_type = elem.get("type", "")
-            if hk_type in TYPE_MAP:
+            if hk_type in HK_TYPE_MAP:
                 records[hk_type].append({
                     "startDate":  elem.get("startDate"),
                     "endDate":    elem.get("endDate"),
@@ -80,16 +55,14 @@ def parse_and_save(export_path: Path, output_dir: Path) -> None:
                 })
 
         elif tag == "Workout":
-            stats = {}
+            avg_hr = None
+            max_hr = None
             for child in elem:
                 if child.tag == "WorkoutStatistics":
-                    stats[child.get("type", "")] = {
-                        "sum":     child.get("sum"),
-                        "average": child.get("average"),
-                        "min":     child.get("minimum"),
-                        "max":     child.get("maximum"),
-                        "unit":    child.get("unit"),
-                    }
+                    stat_type = child.get("type", "")
+                    if "HeartRate" in stat_type:
+                        avg_hr = child.get("average")
+                        max_hr = child.get("maximum")
             workouts.append({
                 "activityType":      elem.get("workoutActivityType", "").replace("HKWorkoutActivityType", ""),
                 "startDate":         elem.get("startDate"),
@@ -99,6 +72,8 @@ def parse_and_save(export_path: Path, output_dir: Path) -> None:
                 "totalDistanceUnit": elem.get("totalDistanceUnit"),
                 "totalEnergy_kcal":  elem.get("totalEnergyBurned"),
                 "sourceName":        elem.get("sourceName"),
+                "avgHeartRate":      avg_hr,
+                "maxHeartRate":      max_hr,
             })
 
         elem.clear()
@@ -108,7 +83,7 @@ def parse_and_save(export_path: Path, output_dir: Path) -> None:
     # -----------------------------------------------------------------------
     saved = []
     for hk_type, rows in records.items():
-        short = TYPE_MAP[hk_type]
+        short = HK_TYPE_MAP[hk_type]
         df = pd.DataFrame(rows)
         df["startDate"] = pd.to_datetime(df["startDate"], utc=True, errors="coerce")
         df["endDate"]   = pd.to_datetime(df["endDate"],   utc=True, errors="coerce")
@@ -129,6 +104,8 @@ def parse_and_save(export_path: Path, output_dir: Path) -> None:
         wdf["duration_min"]     = pd.to_numeric(wdf["duration_min"], errors="coerce")
         wdf["totalDistance"]    = pd.to_numeric(wdf["totalDistance"], errors="coerce")
         wdf["totalEnergy_kcal"] = pd.to_numeric(wdf["totalEnergy_kcal"], errors="coerce")
+        wdf["avgHeartRate"]      = pd.to_numeric(wdf["avgHeartRate"], errors="coerce")
+        wdf["maxHeartRate"]      = pd.to_numeric(wdf["maxHeartRate"], errors="coerce")
         wdf["date"]             = wdf["startDate"].dt.date.astype(str)
         path = output_dir / "workouts.parquet"
         wdf.to_parquet(path, index=False)

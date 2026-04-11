@@ -13,6 +13,8 @@ from typing import Optional
 import pandas as pd
 from mcp.server.fastmcp import FastMCP
 
+from config import HK_TYPE_MAP, SHORT_NAMES, SLEEP_VALUES
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -31,38 +33,6 @@ DATA_DIR = Path(os.environ.get(
 # ---------------------------------------------------------------------------
 
 _cache: dict = {}
-
-# Maps short names -> Parquet filename (no extension)
-TYPE_MAP = {
-    "steps":                    "steps",
-    "heart_rate":               "heart_rate",
-    "resting_hr":               "resting_hr",
-    "active_energy":            "active_energy",
-    "basal_energy":             "basal_energy",
-    "distance_walk":            "distance_walk",
-    "distance_cycling":         "distance_cycling",
-    "flights_climbed":          "flights_climbed",
-    "sleep":                    "sleep",
-    "body_mass":                "body_mass",
-    "bmi":                      "bmi",
-    "body_fat":                 "body_fat",
-    "lean_body_mass":           "lean_body_mass",
-    "walking_speed":            "walking_speed",
-    "walking_steadiness":       "walking_steadiness",
-    "dietary_energy":           "dietary_energy",
-    "dietary_protein":          "dietary_protein",
-    "dietary_carbs":            "dietary_carbs",
-    "dietary_fat":              "dietary_fat",
-}
-
-SLEEP_VALUES = {
-    "HKCategoryValueSleepAnalysisInBed": "InBed",
-    "HKCategoryValueSleepAnalysisAsleepUnspecified": "Asleep",
-    "HKCategoryValueSleepAnalysisAsleepCore": "Core",
-    "HKCategoryValueSleepAnalysisAsleepDeep": "Deep",
-    "HKCategoryValueSleepAnalysisAsleepREM": "REM",
-    "HKCategoryValueSleepAnalysisAwake": "Awake",
-}
 
 
 def _load_data() -> dict:
@@ -95,7 +65,7 @@ def _load_from_parquet() -> None:
     print(f"[apple-health-mcp] Loading from Parquet: {DATA_DIR}", file=sys.stderr)
 
     frames: dict[str, pd.DataFrame] = {}
-    for short in TYPE_MAP:
+    for short in SHORT_NAMES:
         path = DATA_DIR / f"{short}.parquet"
         if path.exists():
             df = pd.read_parquet(path)
@@ -131,28 +101,7 @@ def _load_from_xml() -> None:
     from collections import defaultdict
     import time
 
-    # HK type → short name (reverse of TYPE_MAP for XML parsing)
-    HK_TYPE_MAP = {
-        "HKQuantityTypeIdentifierStepCount":                "steps",
-        "HKQuantityTypeIdentifierHeartRate":                "heart_rate",
-        "HKQuantityTypeIdentifierRestingHeartRate":         "resting_hr",
-        "HKQuantityTypeIdentifierActiveEnergyBurned":       "active_energy",
-        "HKQuantityTypeIdentifierBasalEnergyBurned":        "basal_energy",
-        "HKQuantityTypeIdentifierDistanceWalkingRunning":   "distance_walk",
-        "HKQuantityTypeIdentifierDistanceCycling":          "distance_cycling",
-        "HKQuantityTypeIdentifierFlightsClimbed":           "flights_climbed",
-        "HKCategoryTypeIdentifierSleepAnalysis":            "sleep",
-        "HKQuantityTypeIdentifierBodyMass":                 "body_mass",
-        "HKQuantityTypeIdentifierBodyMassIndex":            "bmi",
-        "HKQuantityTypeIdentifierBodyFatPercentage":        "body_fat",
-        "HKQuantityTypeIdentifierLeanBodyMass":             "lean_body_mass",
-        "HKQuantityTypeIdentifierWalkingSpeed":             "walking_speed",
-        "HKQuantityTypeIdentifierAppleWalkingSteadiness":   "walking_steadiness",
-        "HKQuantityTypeIdentifierDietaryEnergyConsumed":    "dietary_energy",
-        "HKQuantityTypeIdentifierDietaryProtein":           "dietary_protein",
-        "HKQuantityTypeIdentifierDietaryCarbohydrates":     "dietary_carbs",
-        "HKQuantityTypeIdentifierDietaryFatTotal":          "dietary_fat",
-    }
+
 
     t0 = time.time()
     print(f"[apple-health-mcp] Parsing XML: {EXPORT_PATH}", file=sys.stderr)
@@ -177,14 +126,14 @@ def _load_from_xml() -> None:
                     "sourceName": elem.get("sourceName"),
                 })
         elif tag == "Workout":
-            stats = {}
+            avg_hr = None
+            max_hr = None
             for child in elem:
                 if child.tag == "WorkoutStatistics":
-                    stats[child.get("type", "")] = {
-                        "sum": child.get("sum"), "average": child.get("average"),
-                        "min": child.get("minimum"), "max": child.get("maximum"),
-                        "unit": child.get("unit"),
-                    }
+                    stat_type = child.get("type", "")
+                    if "HeartRate" in stat_type:
+                        avg_hr = child.get("average")
+                        max_hr = child.get("maximum")
             workouts.append({
                 "activityType":      elem.get("workoutActivityType", "").replace("HKWorkoutActivityType", ""),
                 "startDate":         elem.get("startDate"),
@@ -194,6 +143,8 @@ def _load_from_xml() -> None:
                 "totalDistanceUnit": elem.get("totalDistanceUnit"),
                 "totalEnergy_kcal":  elem.get("totalEnergyBurned"),
                 "sourceName":        elem.get("sourceName"),
+                "avgHeartRate":      avg_hr,
+                "maxHeartRate":      max_hr,
             })
         elem.clear()
 
@@ -213,6 +164,8 @@ def _load_from_xml() -> None:
         workout_df["duration_min"]     = pd.to_numeric(workout_df["duration_min"], errors="coerce")
         workout_df["totalDistance"]    = pd.to_numeric(workout_df["totalDistance"], errors="coerce")
         workout_df["totalEnergy_kcal"] = pd.to_numeric(workout_df["totalEnergy_kcal"], errors="coerce")
+        workout_df["avgHeartRate"]     = pd.to_numeric(workout_df["avgHeartRate"], errors="coerce")
+        workout_df["maxHeartRate"]     = pd.to_numeric(workout_df["maxHeartRate"], errors="coerce")
         workout_df["date"]             = workout_df["startDate"].dt.date.astype(str)
 
     _cache["frames"]   = frames
@@ -238,7 +191,7 @@ def _filter_dates(df: pd.DataFrame, start: Optional[str], end: Optional[str]) ->
 
 def _date_summary(df: pd.DataFrame, agg: str = "sum") -> str:
     if df.empty:
-        return "No hay datos para el rango especificado."
+        return "No data for the specified range."
     daily = df.groupby("date")["value"].agg(agg).reset_index()
     daily.columns = ["date", "value"]
     daily["value"] = daily["value"].round(2)
@@ -274,7 +227,7 @@ def health_summary() -> str:
     lines.append(f"{'Data type':<45} {'Records':>10}  {'From':<12}  {'To':<12}")
     lines.append("-" * 85)
 
-    for short in TYPE_MAP:
+    for short in SHORT_NAMES:
         df = frames.get(short)
         if df is not None and not df.empty:
             n   = len(df)
@@ -298,12 +251,12 @@ def get_steps(start_date: Optional[str] = None, end_date: Optional[str] = None) 
     """
     df = _get_frame("steps")
     if df is None or df.empty:
-        return "No hay datos de pasos."
+        return "No step data available."
     df = _filter_dates(df, start_date, end_date)
     result = _date_summary(df, "sum")
     total = df["value"].sum()
     avg   = df.groupby("date")["value"].sum().mean()
-    return f"Pasos totales: {total:,.0f}  |  Media diaria: {avg:,.0f}\n\n{result}"
+    return f"Total steps: {total:,.0f}  |  Daily average: {avg:,.0f}\n\n{result}"
 
 
 @mcp.tool()
@@ -319,13 +272,13 @@ def get_heart_rate(
     """
     df = _get_frame("heart_rate")
     if df is None or df.empty:
-        return "No hay datos de frecuencia cardíaca."
+        return "No heart rate data available."
     df = _filter_dates(df, start_date, end_date)
     agg_map = {"mean": "mean", "min": "min", "max": "max"}
     agg = agg_map.get(stat, "mean")
     result = _date_summary(df, agg)
     overall = df["value"].agg(agg)
-    return f"Frecuencia cardíaca ({stat}) global: {overall:.1f} bpm\n\n{result}"
+    return f"Heart rate ({stat}) overall: {overall:.1f} bpm\n\n{result}"
 
 
 @mcp.tool()
@@ -335,7 +288,7 @@ def get_resting_heart_rate(start_date: Optional[str] = None, end_date: Optional[
     """
     df = _get_frame("resting_hr")
     if df is None or df.empty:
-        return "No hay datos de frecuencia cardíaca en reposo."
+        return "No resting heart rate data available."
     df = _filter_dates(df, start_date, end_date)
     return _date_summary(df, "mean")
 
@@ -349,7 +302,7 @@ def get_sleep(start_date: Optional[str] = None, end_date: Optional[str] = None) 
     data = _load_data()
     df = data["frames"].get("sleep")
     if df is None or df.empty:
-        return "No hay datos de sueño."
+        return "No sleep data available."
 
     df = _filter_dates(df, start_date, end_date).copy()
     df["stage"]      = df["value"].map(SLEEP_VALUES).fillna(df["value"])
@@ -371,7 +324,7 @@ def get_sleep(start_date: Optional[str] = None, end_date: Optional[str] = None) 
     pivot["Total_sleep_h"] = total_sleep.round(2)
 
     means = pivot.mean().round(2)
-    header = f"Medias nocturnas:\n{means.to_string()}\n\n"
+    header = f"Nightly averages:\n{means.to_string()}\n\n"
     return header + pivot.to_string()
 
 
@@ -389,14 +342,14 @@ def get_workouts(
     data = _load_data()
     df = data["workouts"].copy()
     if df.empty:
-        return "No hay datos de workouts."
+        return "No workout data available."
 
     if activity_type:
         df = df[df["activityType"].str.contains(activity_type, case=False, na=False)]
     df = _filter_dates(df, start_date, end_date)
 
     if df.empty:
-        return "No hay workouts con los filtros indicados."
+        return "No workouts matching the given filters."
 
     # Summary stats
     n = len(df)
@@ -406,19 +359,22 @@ def get_workouts(
 
     summary = (
         f"Total workouts: {n}\n"
-        f"Tiempo total: {total_min/60:.1f} h\n"
-        f"Energía total: {total_kcal:,.0f} kcal\n"
-        f"Por tipo: {types}\n\n"
+        f"Total time: {total_min/60:.1f} h\n"
+        f"Total energy: {total_kcal:,.0f} kcal\n"
+        f"By type: {types}\n\n"
     )
 
-    display = df[["date", "activityType", "duration_min", "totalDistance",
-                   "totalDistanceUnit", "totalEnergy_kcal", "sourceName"]].head(limit)
+    cols = ["date", "activityType", "duration_min", "totalDistance",
+            "totalDistanceUnit", "totalEnergy_kcal", "avgHeartRate", "maxHeartRate", "sourceName"]
+    display = df[[c for c in cols if c in df.columns]].head(limit)
     display = display.rename(columns={
         "activityType": "type",
         "duration_min": "mins",
         "totalDistance": "dist",
         "totalDistanceUnit": "dist_unit",
         "totalEnergy_kcal": "kcal",
+        "avgHeartRate": "avg_hr",
+        "maxHeartRate": "max_hr",
     })
     return summary + display.to_string(index=False)
 
@@ -440,7 +396,7 @@ def get_body_metrics(start_date: Optional[str] = None, end_date: Optional[str] =
                 daily = df.groupby("date")["value"].mean().round(2).reset_index()
                 results.append(f"--- {short} ({unit}) ---\n{daily.to_string(index=False)}")
 
-    return "\n\n".join(results) if results else "No hay métricas corporales disponibles."
+    return "\n\n".join(results) if results else "No body metrics available."
 
 
 @mcp.tool()
@@ -452,10 +408,10 @@ def get_activity_energy(start_date: Optional[str] = None, end_date: Optional[str
     data = _load_data()
     sections = []
     for short, label in [
-        ("active_energy", "Energía activa (kcal)"),
-        ("basal_energy",  "Energía basal (kcal)"),
-        ("distance_walk", "Distancia caminar/correr"),
-        ("flights_climbed", "Pisos subidos"),
+        ("active_energy", "Active energy (kcal)"),
+        ("basal_energy",  "Basal energy (kcal)"),
+        ("distance_walk", "Walking/running distance"),
+        ("flights_climbed", "Flights climbed"),
     ]:
         df = _get_frame(short)
         if df is not None and not df.empty:
@@ -466,10 +422,10 @@ def get_activity_energy(start_date: Optional[str] = None, end_date: Optional[str
                 avg   = df.groupby("date")["value"].sum().mean()
                 sections.append(
                     f"--- {label} ({unit}) ---\n"
-                    f"Total: {total:,.1f}  |  Media diaria: {avg:,.1f}\n"
+                    f"Total: {total:,.1f}  |  Daily average: {avg:,.1f}\n"
                     f"{_date_summary(df, 'sum')}"
                 )
-    return "\n\n".join(sections) if sections else "No hay datos de energía/actividad."
+    return "\n\n".join(sections) if sections else "No energy/activity data available."
 
 
 @mcp.tool()
@@ -481,17 +437,17 @@ def get_nutrition(start_date: Optional[str] = None, end_date: Optional[str] = No
     data = _load_data()
     sections = []
     for short, label in [
-        ("dietary_energy",  "Energía (kcal)"),
-        ("dietary_protein", "Proteína (g)"),
-        ("dietary_carbs",   "Carbohidratos (g)"),
-        ("dietary_fat",     "Grasa total (g)"),
+        ("dietary_energy",  "Energy (kcal)"),
+        ("dietary_protein", "Protein (g)"),
+        ("dietary_carbs",   "Carbohydrates (g)"),
+        ("dietary_fat",     "Total fat (g)"),
     ]:
         df = _get_frame(short)
         if df is not None and not df.empty:
             df = _filter_dates(df, start_date, end_date)
             if not df.empty:
                 sections.append(f"--- {label} ---\n{_date_summary(df, 'sum')}")
-    return "\n\n".join(sections) if sections else "No hay datos de nutrición disponibles."
+    return "\n\n".join(sections) if sections else "No nutrition data available."
 
 
 @mcp.tool()
@@ -506,16 +462,18 @@ def query_health_data(
     metric: one of steps, heart_rate, resting_hr, active_energy, basal_energy,
             distance_walk, distance_cycling, flights_climbed, sleep, body_mass,
             bmi, body_fat, lean_body_mass, walking_speed, walking_steadiness,
-            dietary_energy, dietary_protein, dietary_carbs, dietary_fat
+            dietary_energy, dietary_protein, dietary_carbs, dietary_fat,
+            headphone_audio, walking_step_length, walking_double_support,
+            walking_asymmetry
     aggregation: sum, mean, min, max (default: sum)
     start_date / end_date: YYYY-MM-DD (optional)
     """
     df = _get_frame(metric)
     if df is None:
-        available = ", ".join(TYPE_MAP.keys())
-        return f"Métrica '{metric}' no reconocida. Disponibles: {available}"
+        available = ", ".join(SHORT_NAMES)
+        return f"Unknown metric '{metric}'. Available: {available}"
     if df.empty:
-        return f"No hay datos para '{metric}'."
+        return f"No data for '{metric}'."
     df = _filter_dates(df, start_date, end_date)
     return _date_summary(df, aggregation)
 
