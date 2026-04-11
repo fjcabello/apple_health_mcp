@@ -199,6 +199,19 @@ def _date_summary(df: pd.DataFrame, agg: str = "sum") -> str:
     return daily.to_string(index=False)
 
 
+def _to_period(date_str: str, granularity: str) -> str:
+    """Map a date string to a period key based on granularity."""
+    d = pd.Timestamp(date_str)
+    if granularity == "weekly":
+        iso = d.isocalendar()
+        return f"{iso.year}-W{iso.week:02d}"
+    if granularity == "monthly":
+        return d.strftime("%Y-%m")
+    if granularity == "yearly":
+        return d.strftime("%Y")
+    return date_str  # daily / nightly
+
+
 # ---------------------------------------------------------------------------
 # MCP Server
 # ---------------------------------------------------------------------------
@@ -246,29 +259,47 @@ def health_summary() -> str:
 
 
 @mcp.tool()
-def get_steps(start_date: Optional[str] = None, end_date: Optional[str] = None) -> str:
+def get_steps(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    granularity: str = "daily",
+) -> str:
     """
-    Returns daily step counts. Optionally filter by start_date and/or end_date (YYYY-MM-DD).
+    Returns step counts aggregated by granularity: daily (default), weekly, monthly, or yearly.
+    Optionally filter by start_date and/or end_date (YYYY-MM-DD).
     """
     df = _get_frame("steps")
     if df is None or df.empty:
         return "No step data available."
     df = _filter_dates(df, start_date, end_date)
-    result = _date_summary(df, "sum")
-    total = df["value"].sum()
-    avg   = df.groupby("date")["value"].sum().mean()
-    return f"Total steps: {total:,.0f}  |  Daily average: {avg:,.0f}\n\n{result}"
+
+    daily = df.groupby("date")["value"].sum().reset_index()
+    daily.columns = ["date", "steps"]
+
+    if granularity == "daily":
+        total = int(daily["steps"].sum())
+        avg   = daily["steps"].mean()
+        daily["steps"] = daily["steps"].round(0).astype(int)
+        return f"Total steps: {total:,}  |  Daily average: {avg:,.0f}\n\n{daily.to_string(index=False)}"
+
+    daily["period"] = daily["date"].apply(lambda d: _to_period(d, granularity))
+    grouped = daily.groupby("period")["steps"].agg(total="sum", avg_daily="mean", days="count")
+    grouped["total"]     = grouped["total"].round(0).astype(int)
+    grouped["avg_daily"] = grouped["avg_daily"].round(0).astype(int)
+    overall_avg = grouped["avg_daily"].mean()
+    return f"Overall avg daily steps: {overall_avg:,.0f}\n\n{grouped.to_string()}"
 
 
 @mcp.tool()
 def get_heart_rate(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
-    stat: str = "mean"
+    stat: str = "mean",
+    granularity: str = "daily",
 ) -> str:
     """
-    Returns heart rate data aggregated by day.
-    stat options: mean, min, max (default: mean).
+    Returns heart rate aggregated by granularity: daily (default), weekly, monthly, or yearly.
+    stat: mean (default), min, max.
     Optionally filter by start_date and/or end_date (YYYY-MM-DD).
     """
     df = _get_frame("heart_rate")
@@ -277,9 +308,20 @@ def get_heart_rate(
     df = _filter_dates(df, start_date, end_date)
     agg_map = {"mean": "mean", "min": "min", "max": "max"}
     agg = agg_map.get(stat, "mean")
-    result = _date_summary(df, agg)
-    overall = df["value"].agg(agg)
-    return f"Heart rate ({stat}) overall: {overall:.1f} bpm\n\n{result}"
+
+    daily = df.groupby("date")["value"].agg(agg).reset_index()
+    daily.columns = ["date", "bpm"]
+    daily["bpm"] = daily["bpm"].round(1)
+
+    if granularity == "daily":
+        overall = daily["bpm"].agg(agg)
+        return f"Heart rate ({stat}) overall: {overall:.1f} bpm\n\n{daily.to_string(index=False)}"
+
+    daily["period"] = daily["date"].apply(lambda d: _to_period(d, granularity))
+    grouped = daily.groupby("period")["bpm"].agg(agg).round(1).reset_index()
+    grouped.columns = ["period", f"bpm_{stat}"]
+    overall = grouped[f"bpm_{stat}"].agg(agg)
+    return f"Heart rate ({stat}) overall: {overall:.1f} bpm\n\n{grouped.to_string(index=False)}"
 
 
 @mcp.tool()
@@ -295,9 +337,14 @@ def get_resting_heart_rate(start_date: Optional[str] = None, end_date: Optional[
 
 
 @mcp.tool()
-def get_sleep(start_date: Optional[str] = None, end_date: Optional[str] = None) -> str:
+def get_sleep(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    granularity: str = "nightly",
+) -> str:
     """
-    Returns sleep analysis: hours per stage (Core, Deep, REM, Awake) aggregated by night.
+    Returns sleep analysis aggregated by granularity: nightly (default), weekly, monthly, or yearly.
+    Columns: Core, Deep, REM, Asleep (pre-watchOS 9), Awake, InBed, Total_sleep_h.
     Optionally filter by start_date and/or end_date (YYYY-MM-DD).
     """
     data = _load_data()
@@ -315,6 +362,7 @@ def get_sleep(start_date: Optional[str] = None, end_date: Optional[str] = None) 
         axis=1,
     )
 
+    # Build nightly pivot
     pivot = (
         df.groupby(["night", "stage"])["duration_h"]
         .sum()
@@ -324,9 +372,19 @@ def get_sleep(start_date: Optional[str] = None, end_date: Optional[str] = None) 
     total_sleep = pivot[[c for c in ["Core", "Deep", "REM", "Asleep"] if c in pivot.columns]].sum(axis=1)
     pivot["Total_sleep_h"] = total_sleep.round(2)
 
-    means = pivot.mean().round(2)
-    header = f"Nightly averages:\n{means.to_string()}\n\n"
-    return header + pivot.to_string()
+    if granularity == "nightly":
+        means = pivot.mean().round(2)
+        header = f"Nightly averages:\n{means.to_string()}\n\n"
+        return header + pivot.to_string()
+
+    # Aggregate nightly data by period
+    pivot = pivot.reset_index()
+    pivot["period"] = pivot["night"].apply(lambda d: _to_period(d, granularity))
+    sleep_cols = [c for c in pivot.columns if c not in ("night", "period")]
+    grouped = pivot.groupby("period")[sleep_cols].mean().round(2)
+    grouped["nights"] = pivot.groupby("period")["night"].count()
+    overall_avg = grouped["Total_sleep_h"].mean()
+    return f"Average total sleep: {overall_avg:.2f} h/night\n\n{grouped.to_string()}"
 
 
 @mcp.tool()

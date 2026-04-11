@@ -90,6 +90,25 @@ def parse_and_save(export_path: Path, output_dir: Path) -> None:
         if hk_type not in CATEGORY_TYPES:
             df["value"] = pd.to_numeric(df["value"], errors="coerce")
         # else: keep value as string (e.g. sleep stage names)
+
+        # --- Sleep-specific cleanup -------------------------------------------
+        if short == "sleep":
+            before = len(df)
+            # 1. Drop exact duplicates (Zepp Life writes the same interval many times)
+            df = df.drop_duplicates(subset=["startDate", "endDate", "value", "sourceName"])
+            # 2. Drop Zepp Life InBed records > 15h (device-on session, not real in-bed time)
+            duration_h = (df["endDate"] - df["startDate"]).dt.total_seconds() / 3600
+            mask_junk = (
+                (df["value"] == "HKCategoryValueSleepAnalysisInBed")
+                & (df["sourceName"] == "Zepp Life")
+                & (duration_h > 15)
+            )
+            df = df[~mask_junk]
+            dropped = before - len(df)
+            if dropped:
+                print(f"    (sleep: removed {dropped:,} duplicate/junk rows)")
+        # ----------------------------------------------------------------------
+
         df["date"]      = df["startDate"].dt.date.astype(str)   # store as str for Parquet compat
         path = output_dir / f"{short}.parquet"
         df.to_parquet(path, index=False)
