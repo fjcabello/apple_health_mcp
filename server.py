@@ -13,7 +13,7 @@ from typing import Optional
 import pandas as pd
 from mcp.server.fastmcp import FastMCP
 
-from config import HK_TYPE_MAP, SHORT_NAMES, SLEEP_VALUES
+from config import HK_TYPE_MAP, SHORT_NAMES, SLEEP_VALUES, CATEGORY_TYPES
 
 # ---------------------------------------------------------------------------
 # Config
@@ -153,7 +153,8 @@ def _load_from_xml() -> None:
         df = pd.DataFrame(rows)
         df["startDate"] = pd.to_datetime(df["startDate"], utc=True, errors="coerce")
         df["endDate"]   = pd.to_datetime(df["endDate"],   utc=True, errors="coerce")
-        df["value"]     = pd.to_numeric(df["value"], errors="coerce")
+        if hk_type not in CATEGORY_TYPES:
+            df["value"] = pd.to_numeric(df["value"], errors="coerce")
         df["date"]      = df["startDate"].dt.date.astype(str)
         frames[short] = df
 

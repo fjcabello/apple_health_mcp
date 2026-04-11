@@ -16,7 +16,7 @@ from pathlib import Path
 from lxml import etree
 import pandas as pd
 
-from config import HK_TYPE_MAP
+from config import HK_TYPE_MAP, CATEGORY_TYPES
 
 # ---------------------------------------------------------------------------
 # Config
@@ -87,7 +87,9 @@ def parse_and_save(export_path: Path, output_dir: Path) -> None:
         df = pd.DataFrame(rows)
         df["startDate"] = pd.to_datetime(df["startDate"], utc=True, errors="coerce")
         df["endDate"]   = pd.to_datetime(df["endDate"],   utc=True, errors="coerce")
-        df["value"]     = pd.to_numeric(df["value"], errors="coerce")
+        if hk_type not in CATEGORY_TYPES:
+            df["value"] = pd.to_numeric(df["value"], errors="coerce")
+        # else: keep value as string (e.g. sleep stage names)
         df["date"]      = df["startDate"].dt.date.astype(str)   # store as str for Parquet compat
         path = output_dir / f"{short}.parquet"
         df.to_parquet(path, index=False)

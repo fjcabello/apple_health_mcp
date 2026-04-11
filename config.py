@@ -32,6 +32,11 @@ HK_TYPE_MAP = {
 # Short names used by the MCP server to load Parquet files
 SHORT_NAMES = sorted(set(HK_TYPE_MAP.values()))
 
+# HK types whose value is a category string (not numeric)
+CATEGORY_TYPES = {
+    "HKCategoryTypeIdentifierSleepAnalysis",
+}
+
 SLEEP_VALUES = {
     "HKCategoryValueSleepAnalysisInBed": "InBed",
     "HKCategoryValueSleepAnalysisAsleepUnspecified": "Asleep",
