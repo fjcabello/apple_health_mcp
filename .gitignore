@@ -10,3 +10,6 @@ data/
 # Exportación de Apple Health (datos personales, puede ser enorme)
 ../apple_health_export/
 *.xml
+
+# Deploy script (contains personal host/user info)
+deploy.sh
