@@ -1,0 +1,12 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Datos preprocesados (se generan con preprocess.py)
+data/
+
+# Exportación de Apple Health (datos personales, puede ser enorme)
+../apple_health_export/
+*.xml
