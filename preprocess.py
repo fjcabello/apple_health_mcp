@@ -94,16 +94,63 @@ def parse_and_save(export_path: Path, output_dir: Path) -> None:
         # --- Sleep-specific cleanup -------------------------------------------
         if short == "sleep":
             before = len(df)
-            # 1. Drop exact duplicates (Zepp Life writes the same interval many times)
+            # 1. Drop exact duplicates
             df = df.drop_duplicates(subset=["startDate", "endDate", "value", "sourceName"])
-            # 2. Drop Zepp Life InBed records > 15h (device-on session, not real in-bed time)
+            # 2. For Zepp Life, keep only the record with the latest endDate per
+            #    (startDate, value) — Zepp writes progressive updates to the same
+            #    session as the night goes on, each with the same startDate but a
+            #    later endDate, so summing them inflates totals dramatically.
+            zepp_mask = df["sourceName"] == "Zepp Life"
+            zepp = df[zepp_mask].copy()
+            other = df[~zepp_mask]
+            zepp = (
+                zepp.sort_values("endDate")
+                    .drop_duplicates(subset=["startDate", "value", "sourceName"], keep="last")
+            )
+            # 3. Merge overlapping Zepp Life intervals per (night, value).
+            #    Zepp progressively appends overlapping segments, so a naive sum
+            #    double-counts the overlapping time. Replace with merged intervals.
+            def _merge_intervals(group: pd.DataFrame) -> pd.DataFrame:
+                g = group.sort_values("startDate")
+                merged = []
+                cur_start = g.iloc[0]["startDate"]
+                cur_end   = g.iloc[0]["endDate"]
+                template  = g.iloc[0].to_dict()
+                for _, row in g.iloc[1:].iterrows():
+                    if row["startDate"] <= cur_end:          # overlapping
+                        cur_end = max(cur_end, row["endDate"])
+                    else:
+                        r = dict(template)
+                        r["startDate"] = cur_start
+                        r["endDate"]   = cur_end
+                        merged.append(r)
+                        cur_start = row["startDate"]
+                        cur_end   = row["endDate"]
+                r = dict(template)
+                r["startDate"] = cur_start
+                r["endDate"]   = cur_end
+                merged.append(r)
+                return pd.DataFrame(merged)
+
+            zepp["_night"] = zepp.apply(
+                lambda r: (pd.Timestamp(r["startDate"]).date() - pd.Timedelta(days=1)).isoformat()
+                if pd.Timestamp(r["startDate"]).hour < 12 else pd.Timestamp(r["startDate"]).date().isoformat(),
+                axis=1,
+            )
+            merged_parts = []
+            for (night, val), grp in zepp.groupby(["_night", "value"]):
+                merged_parts.append(_merge_intervals(grp))
+            zepp_merged = pd.concat(merged_parts, ignore_index=True).drop(columns=["_night"], errors="ignore")
+            df = pd.concat([other, zepp_merged], ignore_index=True)
+
+            # 4. Drop Zepp Life InBed records > 15h (device-on session, not real in-bed time)
             duration_h = (df["endDate"] - df["startDate"]).dt.total_seconds() / 3600
-            mask_junk = (
+            mask_inbed = (
                 (df["value"] == "HKCategoryValueSleepAnalysisInBed")
                 & (df["sourceName"] == "Zepp Life")
                 & (duration_h > 15)
             )
-            df = df[~mask_junk]
+            df = df[~mask_inbed]
             dropped = before - len(df)
             if dropped:
                 print(f"    (sleep: removed {dropped:,} duplicate/junk rows)")
