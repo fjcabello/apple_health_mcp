@@ -16,7 +16,7 @@ from urllib.parse import parse_qsl
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse
-from starlette.routing import Mount, Route
+from starlette.routing import Route
 
 from server import mcp
 
@@ -66,12 +66,27 @@ class ApiKeyMiddleware:
         await self.app(scope, receive, send)
 
 
-base_app = Starlette(routes=[
-    Route("/admin/upload/{filename}", upload_file, methods=["PUT"]),
-    Mount("/", app=mcp.streamable_http_app()),
-])
+mcp_app = mcp.streamable_http_app()
+admin_app = Starlette(routes=[Route("/admin/upload/{filename}", upload_file, methods=["PUT"])])
 
-app = ApiKeyMiddleware(base_app, API_KEY)
+
+class RootApp:
+    """Manual ASGI router: keeps the mcp app's lifespan (task group init) intact,
+    which Starlette's Mount() does not propagate correctly to sub-apps."""
+
+    def __init__(self, mcp_app: object, admin_app: object) -> None:
+        self.mcp_app = mcp_app
+        self.admin_app = admin_app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope["path"].startswith("/admin/upload/"):
+            await self.admin_app(scope, receive, send)
+            return
+        # lifespan and everything else goes to the mcp app so its startup runs
+        await self.mcp_app(scope, receive, send)
+
+
+app = ApiKeyMiddleware(RootApp(mcp_app, admin_app), API_KEY)
 
 if __name__ == "__main__":
     import uvicorn
