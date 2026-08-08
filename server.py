@@ -605,6 +605,49 @@ def _upsert_parquet(short: str, new_rows: list[dict]) -> int:
     return max(added, 0)
 
 
+def _night_key(dt: pd.Timestamp) -> str:
+    """Bucket a timestamp into the 'night' it belongs to (same rule as get_sleep):
+    a sleep event starting before noon belongs to the previous calendar day's night."""
+    if dt.hour < 12:
+        return (dt - pd.Timedelta(days=1)).date().isoformat()
+    return dt.date().isoformat()
+
+
+def _replace_sleep_nights(new_rows: list[dict]) -> int:
+    """
+    Upsert sleep rows, but discard ALL existing rows (historical XML or previous
+    incremental syncs) for any night touched by new_rows, to avoid double-counting
+    when Health Auto Export resends a full nightly summary for the same night.
+    """
+    if not new_rows:
+        return 0
+
+    new_df = pd.DataFrame(new_rows)
+    new_df["startDate"] = pd.to_datetime(new_df["startDate"], utc=True, errors="coerce")
+    new_df["endDate"]   = pd.to_datetime(new_df["endDate"],   utc=True, errors="coerce")
+    new_df["date"]      = new_df["startDate"].dt.date.astype(str)
+    touched_nights = set(new_df["startDate"].apply(_night_key))
+
+    path = DATA_DIR / "sleep.parquet"
+    if path.exists():
+        existing = pd.read_parquet(path)
+        existing["startDate"] = pd.to_datetime(existing["startDate"], utc=True, errors="coerce")
+        existing_nights = existing["startDate"].apply(_night_key)
+        kept = existing[~existing_nights.isin(touched_nights)]
+        removed = len(existing) - len(kept)
+        combined = pd.concat([kept, new_df], ignore_index=True)
+    else:
+        removed = 0
+        combined = new_df
+
+    combined = combined.sort_values("startDate")
+    combined.to_parquet(path, index=False)
+
+    print(f"[apple-health-mcp] sleep: discarded {removed} old rows for {len(touched_nights)} night(s)",
+          file=sys.stderr)
+    return len(new_df)
+
+
 def _hae_qty(value) -> Optional[float]:
     """HAE numeric fields can be a plain number or {"qty": x, "units": ...}."""
     if value is None:
@@ -701,7 +744,7 @@ async def ingest_handler(request):
                         "unit":       "hr",
                         "sourceName": source,
                     })
-            added = _upsert_parquet("sleep", rows)
+            added = _replace_sleep_nights(rows)
             if rows:
                 updated["sleep"] = added
             continue
