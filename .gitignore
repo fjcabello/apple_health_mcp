@@ -13,3 +13,6 @@ data/
 
 # Deploy script (contains personal host/user info)
 deploy.sh
+
+# Local context/session notes (contains personal infra details)
+CONTEXT.md
