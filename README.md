@@ -66,9 +66,29 @@ This single script:
 
 Both `/admin/*` routes require the `API_KEY` Fly secret as a query param (see `wrapper.py`). The key is read from `.fly_secret_local` (gitignored) or the environment.
 
+### 3. Automated sync via Health Auto Export
+
+Instead of manually exporting the Apple Health ZIP, the [Health Auto Export](https://healthyapps.dev)
+iOS app can push data automatically via a webhook, which upserts directly into
+the Parquet files on the Fly volume (no XML/preprocess step needed). This is
+defined in `server.py` (`ingest_app`) and wired into `wrapper.py`'s router.
+
+**Endpoint (calls Fly directly, not through the Cloudflare Worker):**
+
+```
+POST https://fjcabello-apple-health-mcp.fly.dev/ingest
+GET  https://fjcabello-apple-health-mcp.fly.dev/ingest/inspect   (last payload received, for debugging)
+```
+
+Authentication: header `x-api-key: <secret>` or query param `?api_key=<secret>`, checked against the `INTERNAL_SECRET` Fly secret (kept equal to `API_KEY` for simplicity — set both with the same value). This is intentionally separate from the Cloudflare Worker's OAuth, since the iOS app can only set a header, not go through the OAuth flow.
+
+Configure **one automation per data type** in Health Auto Export (the app only allows one data type per automation): Health Metrics, Workouts, etc. — pick the metrics listed in `config.py` → `HK_TYPE_MAP`. Format JSON, export version v2, incremental date range, header `x-api-key` set to the shared secret.
+
+Each `/ingest` call upserts only the metrics/workouts present in that payload (dedup by `startDate`, or `startDate` + `activityType` for workouts) and clears the in-memory cache so the next MCP tool call reloads fresh data — no restart needed.
+
 ## Deploy to Fly.io
 
-The server runs as a Docker container on [Fly.io](https://fly.io) (app `fjcabello-apple-health-mcp`, region `ams`), fronted by `wrapper.py` (an ASGI `api_key` auth gate around `server.py`'s FastMCP app — mirrors the `proxy.cjs` pattern in `garmin-connect-mcp`). Parquet files live on a persistent Fly volume mounted at `/data`, not baked into the image.
+The server runs as a Docker container on [Fly.io](https://fly.io) (app `fjcabello-apple-health-mcp`, region `ams`), fronted by `wrapper.py` (an ASGI router that gates `/mcp` and `/admin/*` behind `API_KEY`, and forwards `/ingest*` to `server.py`'s own-auth `ingest_app` — mirrors the `proxy.cjs` pattern in `garmin-connect-mcp`). Parquet files live on a persistent Fly volume mounted at `/data`, not baked into the image.
 
 ### First-time setup
 
@@ -77,6 +97,7 @@ fly auth login
 fly apps create fjcabello-apple-health-mcp
 fly volumes create apple_health_data --region ams --size 1 --app fjcabello-apple-health-mcp
 fly secrets set API_KEY=$(openssl rand -hex 32) --app fjcabello-apple-health-mcp
+fly secrets set INTERNAL_SECRET=<same value as API_KEY> --app fjcabello-apple-health-mcp
 ```
 
 ### Continuous deployment
