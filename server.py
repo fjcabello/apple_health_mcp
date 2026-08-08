@@ -755,27 +755,39 @@ async def inspect_handler(request):
     return JSONResponse(json.loads(_LAST_PAYLOAD_PATH.read_text()))
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
 async def ingest_info_handler(request):
     from starlette.responses import JSONResponse
     return JSONResponse({"error": "use POST to send Health Auto Export payloads"}, status_code=405)
 
 
+# Reusable Starlette app for the /ingest routes only (no mcp_app mounted here —
+# callers combine this with the MCP app themselves, e.g. wrapper.py on Fly.io,
+# to avoid Starlette's Mount() breaking the MCP app's lifespan/task-group init).
+from starlette.applications import Starlette
+from starlette.routing import Route
+
+ingest_app = Starlette(routes=[
+    Route("/ingest",         endpoint=ingest_handler,      methods=["POST"]),
+    Route("/ingest",         endpoint=ingest_info_handler, methods=["GET"]),
+    Route("/ingest/inspect", endpoint=inspect_handler,     methods=["GET"]),
+])
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
 if __name__ == "__main__":
     import uvicorn
-    from starlette.applications import Starlette
-    from starlette.routing import Route, Mount
 
     mcp_app = mcp.streamable_http_app()
 
-    app = Starlette(routes=[
-        Route("/ingest",         endpoint=ingest_handler,      methods=["POST"]),
-        Route("/ingest",         endpoint=ingest_info_handler, methods=["GET"]),
-        Route("/ingest/inspect", endpoint=inspect_handler,     methods=["GET"]),
-        Mount("/", app=mcp_app),
-    ])
+    class _LocalDevApp:
+        """Manual ASGI router (not Starlette Mount) so mcp_app's lifespan still runs."""
 
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+        async def __call__(self, scope, receive, send):
+            if scope["type"] == "http" and scope["path"].startswith("/ingest"):
+                await ingest_app(scope, receive, send)
+                return
+            await mcp_app(scope, receive, send)
+
+    uvicorn.run(_LocalDevApp(), host="0.0.0.0", port=8001)
