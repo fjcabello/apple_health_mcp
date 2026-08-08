@@ -81,6 +81,59 @@ ssh <user>@<raspberry-pi-ip> "sudo systemctl restart apple-health-mcp"
 
 ---
 
+## Automated sync via Health Auto Export
+
+Instead of manually exporting the Apple Health ZIP, the [Health Auto Export](https://healthyapps.dev)
+iOS app can push data automatically to the server via a `POST /ingest` endpoint,
+which upserts directly into the Parquet files (no XML/preprocess step needed).
+
+### Endpoint
+
+```
+POST /ingest
+GET  /ingest/inspect   (returns the last received payload, for debugging)
+```
+
+Authentication: header `X-API-Key: <secret>` (preferred) or query param `?api_key=<secret>`.
+The secret is read from the `INTERNAL_SECRET` environment variable on the server.
+
+### Recommended app configuration
+
+Create **one automation per data type** in Health Auto Export (the app only allows
+one data type per automation):
+
+| Automation | Data type | Notes |
+|---|---|---|
+| Health Metrics | `Métricas de salud` | Select the metrics listed in `config.py` → `HK_TYPE_MAP` |
+| Workouts | `Entrenamientos` | Enable "Include workout metrics" for HR/energy per workout |
+| Heart rate notifications | `Frecuencia cardiaca` | High/low HR alert events (not yet parsed server-side) |
+
+For all automations:
+
+- **Format:** JSON, **Export version:** v2
+- **Date range:** "Desde última sincronización" (incremental)
+- **Header:** `X-API-Key` → your `INTERNAL_SECRET` value
+- **Batch requests:** enable if you select many metrics or long date ranges — some
+  metrics (e.g. headphone audio exposure) can produce per-minute samples across
+  many hours in a single request, which risks timeouts
+- **Units:** make sure energy metrics are configured to send `kcal` (not `kJ`)
+  to stay consistent with the historical XML-derived data
+- **Cadence:** hourly or daily is plenty — very short intervals (minutes) mostly
+  get self-throttled by the app anyway (min. 60s between real executions)
+
+### How ingestion works
+
+- Each `/ingest` call upserts only the metrics/workouts present in that payload
+  (dedup by `startDate`, or `startDate` + `activityType` for workouts) — it does
+  **not** overwrite unrelated data, so partial/batched requests are safe.
+- The in-memory cache is invalidated after each successful ingest, so the next
+  MCP tool call reloads fresh data from Parquet.
+- `GET /ingest/inspect` (same auth) returns the last raw payload received, useful
+  for verifying the exact JSON shape the app sends before adding support for a
+  new data type (e.g. heart rate notifications, symptoms, ECG).
+
+---
+
 ## Running locally (development)
 
 ```bash
