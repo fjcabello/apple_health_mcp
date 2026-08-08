@@ -565,6 +565,7 @@ _HAE_METRIC_MAP = {
     "dietary_carbohydrates":             "dietary_carbs",
     "dietary_fat_total":                 "dietary_fat",
     "headphone_audio_exposure":          "headphone_audio",
+    "sleep_analysis":                    "sleep",
 }
 
 _INGEST_SECRET = os.environ.get("INTERNAL_SECRET", "")
@@ -584,7 +585,8 @@ def _upsert_parquet(short: str, new_rows: list[dict]) -> int:
     new_df = pd.DataFrame(new_rows)
     new_df["startDate"] = pd.to_datetime(new_df["startDate"], utc=True, errors="coerce")
     new_df["endDate"]   = pd.to_datetime(new_df["endDate"],   utc=True, errors="coerce")
-    new_df["value"]     = pd.to_numeric(new_df["value"], errors="coerce")
+    if short != "sleep":
+        new_df["value"] = pd.to_numeric(new_df["value"], errors="coerce")
     new_df["date"]      = new_df["startDate"].dt.date.astype(str)
 
     path = DATA_DIR / f"{short}.parquet"
@@ -668,6 +670,42 @@ async def ingest_handler(request):
     metrics = data_root.get("metrics", [])
     for metric in metrics:
         hae_name = metric.get("name", "")
+
+        # sleep_analysis has a nightly-summary shape (rem/core/deep/awake in hours),
+        # not the generic {date, qty} sample shape used by other metrics.
+        if hae_name == "sleep_analysis":
+            rows = []
+            for i, sample in enumerate(metric.get("data", [])):
+                sleep_start = sample.get("sleepStart") or sample.get("inBedStart")
+                if not sleep_start:
+                    continue
+                base = pd.to_datetime(sleep_start, utc=True, errors="coerce")
+                if pd.isna(base):
+                    continue
+                source = sample.get("source", "HealthAutoExport")
+                for stage_key, stage_label in [
+                    ("core", "Core"), ("deep", "Deep"),
+                    ("rem", "REM"), ("awake", "Awake"),
+                ]:
+                    hours = sample.get(stage_key)
+                    if not hours:
+                        continue
+                    # Offset each stage's synthetic startDate by a few seconds so
+                    # they don't collide on the startDate-based dedup key.
+                    start = base + pd.Timedelta(seconds=stage_key.__hash__() % 60)
+                    end = start + pd.Timedelta(hours=float(hours))
+                    rows.append({
+                        "startDate":  start.isoformat(),
+                        "endDate":    end.isoformat(),
+                        "value":      stage_label,
+                        "unit":       "hr",
+                        "sourceName": source,
+                    })
+            added = _upsert_parquet("sleep", rows)
+            if rows:
+                updated["sleep"] = added
+            continue
+
         short = _HAE_METRIC_MAP.get(hae_name)
         if not short:
             continue
