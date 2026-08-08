@@ -678,6 +678,11 @@ async def inspect_handler(request):
 # Entry point
 # ---------------------------------------------------------------------------
 
+async def ingest_info_handler(request):
+    from starlette.responses import JSONResponse
+    return JSONResponse({"error": "use POST to send Health Auto Export payloads"}, status_code=405)
+
+
 if __name__ == "__main__":
     import uvicorn
     from starlette.applications import Starlette
@@ -686,8 +691,9 @@ if __name__ == "__main__":
     mcp_app = mcp.streamable_http_app()
 
     app = Starlette(routes=[
-        Route("/ingest",         endpoint=ingest_handler,  methods=["POST"]),
-        Route("/ingest/inspect", endpoint=inspect_handler, methods=["GET"]),
+        Route("/ingest",         endpoint=ingest_handler,      methods=["POST"]),
+        Route("/ingest",         endpoint=ingest_info_handler, methods=["GET"]),
+        Route("/ingest/inspect", endpoint=inspect_handler,     methods=["GET"]),
         Mount("/", app=mcp_app),
     ])
 
