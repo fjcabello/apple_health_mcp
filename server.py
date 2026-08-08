@@ -572,7 +572,7 @@ _LAST_PAYLOAD_PATH = DATA_DIR / "_last_ingest_payload.json"
 
 
 def _check_ingest_auth(request) -> bool:
-    api_key = request.query_params.get("api_key", "")
+    api_key = request.headers.get("x-api-key") or request.query_params.get("api_key", "")
     return not _INGEST_SECRET or api_key == _INGEST_SECRET
 
 
@@ -603,6 +603,49 @@ def _upsert_parquet(short: str, new_rows: list[dict]) -> int:
     return max(added, 0)
 
 
+def _hae_qty(value) -> Optional[float]:
+    """HAE numeric fields can be a plain number or {"qty": x, "units": ...}."""
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        value = value.get("qty")
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _upsert_workouts(new_rows: list[dict]) -> int:
+    """Merge new workout rows into workouts.parquet, dedup by startDate."""
+    if not new_rows:
+        return 0
+
+    new_df = pd.DataFrame(new_rows)
+    new_df["startDate"]        = pd.to_datetime(new_df["startDate"], utc=True, errors="coerce")
+    new_df["endDate"]          = pd.to_datetime(new_df["endDate"],   utc=True, errors="coerce")
+    new_df["duration_min"]     = pd.to_numeric(new_df["duration_min"], errors="coerce")
+    new_df["totalDistance"]    = pd.to_numeric(new_df["totalDistance"], errors="coerce")
+    new_df["totalEnergy_kcal"] = pd.to_numeric(new_df["totalEnergy_kcal"], errors="coerce")
+    new_df["avgHeartRate"]     = pd.to_numeric(new_df["avgHeartRate"], errors="coerce")
+    new_df["maxHeartRate"]     = pd.to_numeric(new_df["maxHeartRate"], errors="coerce")
+    new_df["date"]             = new_df["startDate"].dt.date.astype(str)
+
+    path = DATA_DIR / "workouts.parquet"
+    if path.exists():
+        existing = pd.read_parquet(path)
+        existing["startDate"] = pd.to_datetime(existing["startDate"], utc=True, errors="coerce")
+        combined = pd.concat([existing, new_df], ignore_index=True)
+        combined = combined.drop_duplicates(subset=["startDate", "activityType"], keep="last")
+    else:
+        combined = new_df
+
+    combined = combined.sort_values("startDate")
+    combined.to_parquet(path, index=False)
+
+    added = len(combined) - (len(existing) if path.exists() else 0)
+    return max(added, 0)
+
+
 async def ingest_handler(request):
     from starlette.responses import JSONResponse
     import json
@@ -620,8 +663,9 @@ async def ingest_handler(request):
     _LAST_PAYLOAD_PATH.write_text(json.dumps(payload, indent=2, default=str))
 
     updated: dict[str, int] = {}
+    data_root = payload.get("data", payload)
 
-    metrics = payload.get("data", payload).get("metrics", [])
+    metrics = data_root.get("metrics", [])
     for metric in metrics:
         hae_name = metric.get("name", "")
         short = _HAE_METRIC_MAP.get(hae_name)
@@ -653,6 +697,43 @@ async def ingest_handler(request):
         added = _upsert_parquet(short, rows)
         if rows:
             updated[short] = added
+
+    workouts = data_root.get("workouts", [])
+    workout_rows = []
+    for w in workouts:
+        start_str = w.get("start") or w.get("startDate")
+        end_str   = w.get("end") or w.get("endDate")
+        if not start_str:
+            continue
+        start = pd.to_datetime(start_str, utc=True, errors="coerce")
+        end   = pd.to_datetime(end_str, utc=True, errors="coerce") if end_str else start
+        if pd.isna(start):
+            continue
+
+        duration_sec = _hae_qty(w.get("duration"))
+        distance     = w.get("distance") or w.get("totalDistance")
+        energy       = w.get("activeEnergyBurned") or w.get("totalEnergyBurned")
+
+        hr_samples = w.get("heartRateData", [])
+        avg_values = [_hae_qty(s.get("Avg")) for s in hr_samples if _hae_qty(s.get("Avg")) is not None]
+        max_values = [_hae_qty(s.get("Max")) for s in hr_samples if _hae_qty(s.get("Max")) is not None]
+
+        workout_rows.append({
+            "activityType":      w.get("name", "Unknown"),
+            "startDate":         start.isoformat(),
+            "endDate":           end.isoformat(),
+            "duration_min":      (duration_sec / 60) if duration_sec is not None else None,
+            "totalDistance":     _hae_qty(distance),
+            "totalDistanceUnit": distance.get("units", "") if isinstance(distance, dict) else "",
+            "totalEnergy_kcal":  _hae_qty(energy),
+            "avgHeartRate":      (sum(avg_values) / len(avg_values)) if avg_values else None,
+            "maxHeartRate":      max(max_values) if max_values else None,
+            "sourceName":        w.get("source", "HealthAutoExport"),
+        })
+
+    added_workouts = _upsert_workouts(workout_rows)
+    if workout_rows:
+        updated["workouts"] = added_workouts
 
     # Invalidate in-memory cache so next tool call reloads fresh data
     _cache.clear()
