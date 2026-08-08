@@ -8,21 +8,20 @@ An [MCP](https://modelcontextprotocol.io/) server that exposes Apple Health data
 exportación.xml (Apple Health)
         │
         ▼
-  preprocess.py  ──►  data/*.parquet   (run once on Mac)
+  preprocess.py  ──►  data/*.parquet   (run locally on Mac)
                               │
-                              ▼  (rsync to Pi)
-                        server.py (FastMCP, port 8001)
+                              ▼  (sync_to_fly.sh, over plain HTTPS)
+                     Fly.io: fjcabello-apple-health-mcp
+                        ├─ wrapper.py (FastMCP app + api_key ASGI gate, port 8080)
+                        └─ /data volume (persistent, 1GB) ─ loaded by server.py
                               │
                               ▼
-            Cloudflare Tunnel → <your-apple-health-tunnel-hostname>
+         apple-health-fly-mcp-worker (Cloudflare Worker, OAuth gateway)
                               │
-                              ▼
-              apple-health-worker (Cloudflare Worker OAuth)
-                              │
-                    https://<your-worker>.workers.dev
+                    https://apple-health-fly-mcp-worker.fjcabello.workers.dev/mcp
 ```
 
-The server loads Parquet files at startup (~1-2 s). If they are not found, it falls back to parsing the XML directly.
+The server loads Parquet files at startup (~1-2 s) and caches them in memory. If they are not found, it falls back to parsing the XML directly. `server.py` is never modified for deployment concerns — `wrapper.py` wraps it with the api_key auth gate and the admin sync endpoints (see "Deploy to Fly.io" below).
 
 ---
 
@@ -49,40 +48,46 @@ uvicorn>=0.30.0
 
 ## Data update workflow
 
-There are two ways to keep data up to date: a manual export/preprocess flow, and
-an automated push via the [Health Auto Export](https://healthyapps.dev) app.
-
 ### 1. Export from iPhone
 
-`Health → profile → Export All Health Data` → produces a ZIP containing `exportación.xml`.
+`Health → profile → Export All Health Data` → produces a ZIP containing `exportación.xml`. Unzip it so the file lands at `../apple_health_export/exportación.xml` (relative to this repo), or pass a custom path.
 
-### 2. Preprocess on Mac
+### 2. Sync to Fly.io
 
 ```bash
 cd ~/Personal/apple_health/apple_health_mcp
-
-# XML is expected at ../apple_health_export/exportación.xml (default)
-python preprocess.py
-
-# Or with a custom path:
-python preprocess.py --export /path/to/exportación.xml
+./sync_to_fly.sh
 ```
 
-Produces `data/*.parquet` (~20 files, one per metric type).
+This single script:
+1. Runs `preprocess.py` (XML → `data/*.parquet`, ~20-25 files, one per metric type)
+2. Uploads every Parquet file to the Fly volume via `PUT /admin/upload/<filename>?api_key=...` (plain HTTPS — SSH/SFTP tunnels to Fly are blocked on this network)
+3. Calls `POST /admin/reload?api_key=...` to clear the in-memory cache, so the next tool call picks up the fresh data — no machine restart needed
 
-### 3. Sync data to Raspberry Pi
+Both `/admin/*` routes require the `API_KEY` Fly secret as a query param (see `wrapper.py`). The key is read from `.fly_secret_local` (gitignored) or the environment.
+
+## Deploy to Fly.io
+
+The server runs as a Docker container on [Fly.io](https://fly.io) (app `fjcabello-apple-health-mcp`, region `ams`), fronted by `wrapper.py` (an ASGI `api_key` auth gate around `server.py`'s FastMCP app — mirrors the `proxy.cjs` pattern in `garmin-connect-mcp`). Parquet files live on a persistent Fly volume mounted at `/data`, not baked into the image.
+
+### First-time setup
 
 ```bash
-rsync -avz \
-  ~/path/to/apple_health_mcp/data/ \
-  <user>@<raspberry-pi-ip>:/home/<user>/applehealth/apple_health_mcp/data/
+fly auth login
+fly apps create fjcabello-apple-health-mcp
+fly volumes create apple_health_data --region ams --size 1 --app fjcabello-apple-health-mcp
+fly secrets set API_KEY=$(openssl rand -hex 32) --app fjcabello-apple-health-mcp
 ```
 
-### 4. Restart the service on the Pi
+### Continuous deployment
 
-```bash
-ssh <user>@<raspberry-pi-ip> "sudo systemctl restart apple-health-mcp"
-```
+[.github/workflows/deploy.yml](.github/workflows/deploy.yml) auto-deploys to Fly.io on every push to `main`, using a `FLY_API_TOKEN` repo secret (`fly tokens create deploy --app fjcabello-apple-health-mcp`).
+
+> **Why CI instead of `fly deploy` locally:** on this network, Fly's remote "depot" builder and SSH/SFTP tunnels hang indefinitely / fail the WebSocket handshake (corporate SSL/proxy inspection). Deploying from a GitHub-hosted runner avoids this entirely.
+
+### Seeding / updating data
+
+See "Data update workflow" above — use `./sync_to_fly.sh`, not SSH.
 
 ---
 
@@ -99,65 +104,6 @@ Optional environment variables:
 |---|---|---|
 | `APPLE_HEALTH_DATA_DIR` | `./data` | Directory containing `.parquet` files |
 | `APPLE_HEALTH_EXPORT` | `../apple_health_export/exportación.xml` | XML fallback path |
-
----
-
-## Raspberry Pi deployment
-
-### Systemd service
-
-File: `/etc/systemd/system/apple-health-mcp.service`
-
-```ini
-[Unit]
-Description=Apple Health MCP Server
-After=network.target
-
-[Service]
-User=<user>
-WorkingDirectory=/home/<user>/applehealth
-Environment=APPLE_HEALTH_DATA_DIR=/home/<user>/applehealth/apple_health_mcp/data
-ExecStart=/home/<user>/applehealth/apple_health_mcp/.venv/bin/python \
-          /home/<user>/applehealth/apple_health_mcp/server.py
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable apple-health-mcp
-sudo systemctl start apple-health-mcp
-sudo systemctl status apple-health-mcp
-```
-
-### Cloudflare Tunnel
-
-Both Apple Health and Garmin MCP services share the **same tunnel**, remotely managed via the [Cloudflare Zero Trust dashboard](https://one.dash.cloudflare.com/).
-
-- **Tunnel name:** `<your-tunnel-name>`
-- **Tunnel ID:** `<your-tunnel-id>`
-
-| Public hostname | Local service |
-|---|---|
-| `<your-apple-health-hostname>` | `http://127.0.0.1:8001` (Apple Health MCP) |
-| `<your-garmin-hostname>` | `http://127.0.0.1:8000` (Garmin MCP) |
-
-The `cloudflared` service on the Pi connects to Cloudflare and picks up the routing rules from the dashboard automatically.
-
-```bash
-# Check tunnel status on the Pi
-sudo systemctl status cloudflared
-
-# Add/edit public hostnames:
-# Cloudflare Zero Trust → Networks → Tunnels → <your-tunnel-name> → Public Hostnames
-```
-
-**Public MCP endpoint:**
-```
-https://<your-apple-health-hostname>/mcp
-```
 
 ---
 
@@ -188,7 +134,7 @@ All tools accept optional `start_date` and `end_date` parameters in `YYYY-MM-DD`
 
 The Cloudflare Worker adds OAuth 2.0 authentication for remote access from Claude.ai or VS Code.
 
-**Public URL:** `https://<your-worker>.workers.dev/mcp`
+**Public URL:** `https://apple-health-fly-mcp-worker.fjcabello.workers.dev/mcp`
 
 ### VS Code configuration
 
@@ -198,7 +144,7 @@ The Cloudflare Worker adds OAuth 2.0 authentication for remote access from Claud
   "servers": {
     "apple-health-cloud": {
       "type": "http",
-      "url": "https://<your-worker>.workers.dev/mcp"
+      "url": "https://apple-health-fly-mcp-worker.fjcabello.workers.dev/mcp"
     }
   }
 }
@@ -206,58 +152,4 @@ The Cloudflare Worker adds OAuth 2.0 authentication for remote access from Claud
 
 ### Worker source
 
-See `../apple-health-worker/` in the workspace.
-
----
-
-## Automated sync via Health Auto Export
-
-Instead of manually exporting the Apple Health ZIP, the [Health Auto Export](https://healthyapps.dev)
-iOS app can push data automatically to the server via a `POST /ingest` endpoint,
-which upserts directly into the Parquet files (no XML/preprocess step needed).
-
-### Endpoint
-
-```
-POST /ingest
-GET  /ingest/inspect   (returns the last received payload, for debugging)
-```
-
-Authentication: header `X-API-Key: <secret>` (preferred) or query param `?api_key=<secret>`.
-The secret is read from the `INTERNAL_SECRET` environment variable on the server
-(separate from any Cloudflare Worker OAuth secret — this one guards the raw `/ingest` route).
-
-### Recommended app configuration
-
-Create **one automation per data type** in Health Auto Export (the app only allows
-one data type per automation):
-
-| Automation | Data type | Notes |
-|---|---|---|
-| Health Metrics | `Métricas de salud` | Select the metrics listed in `config.py` → `HK_TYPE_MAP` |
-| Workouts | `Entrenamientos` | Enable "Include workout metrics" for HR/energy per workout |
-| Heart rate notifications | `Frecuencia cardiaca` | High/low HR alert events (not yet parsed server-side) |
-
-For all automations:
-
-- **Format:** JSON, **Export version:** v2
-- **Date range:** "Desde última sincronización" (incremental)
-- **Header:** `X-API-Key` → your `INTERNAL_SECRET` value
-- **Batch requests:** enable if you select many metrics or long date ranges —
-  some metrics (e.g. headphone audio exposure) can produce per-minute samples
-  across many hours in a single request, which risks timeouts
-- **Units:** make sure energy metrics are configured to send `kcal` (not `kJ`)
-  to stay consistent with the historical XML-derived data
-- **Cadence:** hourly or daily is plenty — very short intervals (minutes) mostly
-  get self-throttled by the app anyway (min. 60s between real executions)
-
-### How ingestion works
-
-- Each `/ingest` call upserts only the metrics/workouts present in that payload
-  (dedup by `startDate`, or `startDate` + `activityType` for workouts) — it does
-  **not** overwrite unrelated data, so partial/batched requests are safe.
-- The in-memory cache is invalidated after each successful ingest, so the next
-  MCP tool call reloads fresh data from Parquet.
-- `GET /ingest/inspect` (same auth) returns the last raw payload received, useful
-  for verifying the exact JSON shape the app sends before adding support for a
-  new data type (e.g. heart rate notifications, symptoms, ECG).
+See [fjcabello/apple-health-fly-mcp-worker](https://github.com/fjcabello/apple-health-fly-mcp-worker) (`../apple-health-fly-worker/` in the local workspace). Same multi-MCP OAuth gateway pattern as `garmin-connect-mcp`'s `mcp-oauth-gateway`.
