@@ -16,7 +16,3 @@ deploy.sh
 
 # Local context/session notes (contains personal infra details)
 CONTEXT.md
-
-# Local secret dump (never commit)
-.fly_secret_local
-
