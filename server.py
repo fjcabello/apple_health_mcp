@@ -538,10 +538,157 @@ def query_health_data(
 
 
 # ---------------------------------------------------------------------------
+# /ingest endpoint — receives Health Auto Export webhook payloads
+# ---------------------------------------------------------------------------
+
+# Health Auto Export metric names → our Parquet short names
+_HAE_METRIC_MAP = {
+    "step_count":                        "steps",
+    "heart_rate":                        "heart_rate",
+    "resting_heart_rate":                "resting_hr",
+    "active_energy":                     "active_energy",
+    "basal_energy_burned":               "basal_energy",
+    "walking_running_distance":          "distance_walk",
+    "cycling_distance":                  "distance_cycling",
+    "flights_climbed":                   "flights_climbed",
+    "weight_body_mass":                  "body_mass",
+    "body_mass_index":                   "bmi",
+    "body_fat_percentage":               "body_fat",
+    "lean_body_mass":                    "lean_body_mass",
+    "walking_speed":                     "walking_speed",
+    "walking_step_length":               "walking_step_length",
+    "walking_double_support_percentage": "walking_double_support",
+    "walking_asymmetry_percentage":      "walking_asymmetry",
+    "apple_walking_steadiness":          "walking_steadiness",
+    "dietary_energy_consumed":           "dietary_energy",
+    "dietary_protein":                   "dietary_protein",
+    "dietary_carbohydrates":             "dietary_carbs",
+    "dietary_fat_total":                 "dietary_fat",
+    "headphone_audio_exposure":          "headphone_audio",
+}
+
+_INGEST_SECRET = os.environ.get("INTERNAL_SECRET", "")
+_LAST_PAYLOAD_PATH = DATA_DIR / "_last_ingest_payload.json"
+
+
+def _check_ingest_auth(request) -> bool:
+    api_key = request.query_params.get("api_key", "")
+    return not _INGEST_SECRET or api_key == _INGEST_SECRET
+
+
+def _upsert_parquet(short: str, new_rows: list[dict]) -> int:
+    """Merge new_rows into the existing Parquet for `short`, dedup by startDate. Returns rows added."""
+    if not new_rows:
+        return 0
+
+    new_df = pd.DataFrame(new_rows)
+    new_df["startDate"] = pd.to_datetime(new_df["startDate"], utc=True, errors="coerce")
+    new_df["endDate"]   = pd.to_datetime(new_df["endDate"],   utc=True, errors="coerce")
+    new_df["value"]     = pd.to_numeric(new_df["value"], errors="coerce")
+    new_df["date"]      = new_df["startDate"].dt.date.astype(str)
+
+    path = DATA_DIR / f"{short}.parquet"
+    if path.exists():
+        existing = pd.read_parquet(path)
+        existing["startDate"] = pd.to_datetime(existing["startDate"], utc=True, errors="coerce")
+        combined = pd.concat([existing, new_df], ignore_index=True)
+        combined = combined.drop_duplicates(subset=["startDate"], keep="last")
+    else:
+        combined = new_df
+
+    combined = combined.sort_values("startDate")
+    combined.to_parquet(path, index=False)
+
+    added = len(combined) - (len(existing) if path.exists() else 0)
+    return max(added, 0)
+
+
+async def ingest_handler(request):
+    from starlette.responses import JSONResponse
+    import json
+
+    if not _check_ingest_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+
+    # Save raw payload for debugging (overwritten each call)
+    DATA_DIR.mkdir(exist_ok=True)
+    _LAST_PAYLOAD_PATH.write_text(json.dumps(payload, indent=2, default=str))
+
+    updated: dict[str, int] = {}
+
+    metrics = payload.get("data", payload).get("metrics", [])
+    for metric in metrics:
+        hae_name = metric.get("name", "")
+        short = _HAE_METRIC_MAP.get(hae_name)
+        if not short:
+            continue
+
+        unit = metric.get("units", "")
+        rows = []
+        for sample in metric.get("data", []):
+            date_str = sample.get("date") or sample.get("startDate")
+            if not date_str:
+                continue
+            # HAE sends qty for most metrics; heart_rate sends Avg/Min/Max
+            value = sample.get("qty") or sample.get("Avg") or sample.get("value")
+            if value is None:
+                continue
+            start = pd.to_datetime(date_str, utc=True, errors="coerce")
+            if pd.isna(start):
+                continue
+            end_str = sample.get("endDate", date_str)
+            rows.append({
+                "startDate":  start.isoformat(),
+                "endDate":    pd.to_datetime(end_str, utc=True, errors="coerce").isoformat(),
+                "value":      float(value),
+                "unit":       unit,
+                "sourceName": sample.get("source", "HealthAutoExport"),
+            })
+
+        added = _upsert_parquet(short, rows)
+        if rows:
+            updated[short] = added
+
+    # Invalidate in-memory cache so next tool call reloads fresh data
+    _cache.clear()
+
+    print(f"[apple-health-mcp] /ingest: updated {updated}", file=sys.stderr)
+    return JSONResponse({"ok": True, "updated": updated})
+
+
+async def inspect_handler(request):
+    from starlette.responses import JSONResponse
+    import json
+
+    if not _check_ingest_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    if not _LAST_PAYLOAD_PATH.exists():
+        return JSONResponse({"error": "no payload received yet"}, status_code=404)
+
+    return JSONResponse(json.loads(_LAST_PAYLOAD_PATH.read_text()))
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     import uvicorn
-    app = mcp.streamable_http_app()
+    from starlette.applications import Starlette
+    from starlette.routing import Route, Mount
+
+    mcp_app = mcp.streamable_http_app()
+
+    app = Starlette(routes=[
+        Route("/ingest",         endpoint=ingest_handler,  methods=["POST"]),
+        Route("/ingest/inspect", endpoint=inspect_handler, methods=["GET"]),
+        Mount("/", app=mcp_app),
+    ])
+
     uvicorn.run(app, host="0.0.0.0", port=8001)
